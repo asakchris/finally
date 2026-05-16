@@ -454,3 +454,39 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes
+
+### Questions & Clarifications
+
+**Sparklines for newly added tickers**: Sparklines accumulate from SSE since page load. If the user adds a new ticker mid-session, its sparkline starts empty. Is that acceptable, or should the backend provide a short price history buffer for newly added tickers?
+ANSWER: Backend should provide a short price history buffer for newly added tickers.
+
+**Daily change % calculation**: The watchlist shows "daily change %" but the simulator only tracks current vs. previous tick prices — there's no concept of a session open price. Should daily % be calculated from each ticker's seed price? From the price at page load? Needs a decision before implementation.
+ANSWER: Daily % should be calculated from each ticker's seed price.
+
+**SSE stream scope vs. positions**: The SSE stream covers "all tickers known to the system." If a user removes a ticker from the watchlist but still holds a position in it, does that ticker still get priced? The positions table needs live prices for P&L calculations regardless of watchlist membership.
+ANSWER: Yes, still get the price.
+
+**Position row on full sell**: When a sell brings quantity to zero, should the `positions` row be deleted or kept at `quantity=0`? The plan doesn't specify; this affects the positions table display and P&L calculations.
+ANSWER: Delete the row.
+
+**LLM batch trade sequencing**: Multiple trades can arrive in a single LLM response. If trade #1 exhausts available cash, does trade #2 fail? Or does the backend simulate sequential execution in order? The plan says each trade is validated the same as manual trades, but doesn't address intra-batch ordering.
+ANSWER: Backend should simulate sequential execution in order.
+
+**Conversation history limit**: The backend loads "recent conversation history" from `chat_messages`. Is there a hard limit (e.g., last N messages)? Unbounded history will grow tokens/cost over time. An explicit cap should be specified.
+ANSWER: Show last 10 messages, also make it configurable from the backend.
+
+**Massive API endpoint**: The plan says "REST API polling" but doesn't name the specific Polygon.io endpoint. Implementing agents will need the exact endpoint (e.g., `/v2/snapshot/locale/us/markets/stocks/tickers`) to avoid ambiguity.
+ANSWER: Find the exact endpoint by going through the Massive API documentation.
+
+**`backend/db/` vs. `db/` naming**: Two directories named `db/` — one under `backend/` for schema files, one at the project root for the runtime SQLite file. This is a likely source of confusion for agents. Consider renaming `backend/db/` to `backend/schema/` or `backend/sql/`.
+ANSWER: Rename `backend/db/` to `backend/schema/`.
+
+**Use `docker compose up` as the primary launch method**: `docker-compose.yml` already exists. For students, `docker compose up` is a single, familiar command. The custom start/stop shell scripts add maintenance burden on top of it. Make the scripts thin wrappers or remove them in favor of a documented compose command.
+ANSWER: I agree.
+
+**`LLM_MOCK` mock response content is unspecified**: The plan says `LLM_MOCK=true` returns "deterministic mock responses" but doesn't define what those responses look like. E2E tests are written against these mocks — their content needs to be specified or the test scenarios will be underspecified.
+ANSWER: You need to define the response.
