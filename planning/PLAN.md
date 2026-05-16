@@ -88,7 +88,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
+│   └── schema/               # Schema definitions, seed data, migration logic
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
@@ -101,7 +101,7 @@ finally/
 ├── db/                       # Volume mount target (SQLite file lives here at runtime)
 │   └── .gitkeep              # Directory exists in repo; finally.db is gitignored
 ├── Dockerfile                # Multi-stage build (Node → Python)
-├── docker-compose.yml        # Optional convenience wrapper
+├── docker-compose.yml        # Primary launch method
 ├── .env                      # Environment variables (gitignored, .env.example committed)
 └── .gitignore
 ```
@@ -110,7 +110,7 @@ finally/
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`backend/schema/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
@@ -130,6 +130,9 @@ MASSIVE_API_KEY=
 
 # Optional: Set to "true" for deterministic mock LLM responses (testing)
 LLM_MOCK=false
+
+# Optional: Number of recent chat messages included in LLM context
+CHAT_HISTORY_LIMIT=10
 ```
 
 ### Behavior
@@ -137,6 +140,7 @@ LLM_MOCK=false
 - If `MASSIVE_API_KEY` is set and non-empty → backend uses Massive REST API for market data
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
+- `CHAT_HISTORY_LIMIT` controls how many recent messages are included in the LLM context window (default: 10)
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
 
 ---
@@ -155,28 +159,33 @@ Both the simulator and the Massive client implement the same abstract interface.
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
 - Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
 - Runs as an in-process background task — no external dependencies
+- **Daily change %** is calculated relative to each ticker's seed price (the fixed starting price for the session), not the previous SSE tick
 
 ### Massive API (Optional)
 
 - REST API polling (not WebSocket) — simpler, works on all tiers
-- Polls for the union of all watched tickers on a configurable interval
+- Polls for the union of all watched tickers + any tickers with active positions on a configurable interval
 - Free tier (5 calls/min): poll every 15 seconds
 - Paid tiers: poll every 2-15 seconds depending on tier
+- **Endpoint**: `GET /v2/snapshot/locale/us/markets/stocks/tickers?tickers=AAPL,GOOGL,...`
+- **Current price field**: `lastTrade.p` from each ticker object in the response
+- **Daily change %**: use `todaysChangePerc` from the response (pre-calculated by Massive)
 - Parses REST response into the same format as the simulator
 
 ### Shared Price Cache
 
 - A single background task (simulator or Massive poller) writes to an in-memory price cache
-- The cache holds the latest price, previous price, and timestamp for each ticker
+- The cache holds the latest price, previous price, seed price (for daily % calc), and timestamp for each ticker
+- The cache also maintains a ring buffer of the last 100 price points per ticker for sparkline initialization — this allows the frontend to seed sparklines immediately when a new ticker is added mid-session rather than waiting for SSE accumulation
 - SSE streams read from this cache and push updates to connected clients
-- This architecture supports future multi-user scenarios without changes to the data layer
+- **Tracked tickers**: the union of the current watchlist and any ticker with an active position — a ticker removed from the watchlist but still held as a position continues to receive price updates
 
 ### SSE Streaming
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
-- Each SSE event contains ticker, price, previous price, timestamp, and change direction
+- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — the union of the watchlist and any ticker with an active position
+- Each SSE event contains ticker, price, previous price, daily change %, timestamp, and change direction
 - Client handles reconnection automatically (EventSource has built-in retry)
 
 ---
@@ -215,6 +224,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
+- When a sell reduces quantity to zero, the row is deleted (not zeroed out)
 
 **trades** — Trade history (append-only log)
 - `id` TEXT PRIMARY KEY (UUID)
@@ -252,6 +262,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/stream/prices` | SSE stream of live price updates |
+| GET | `/api/prices/{ticker}/history` | Recent price history buffer (up to last 100 points) for sparkline seeding |
 
 ### Portfolio
 | Method | Path | Description |
@@ -290,7 +301,7 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads the last `CHAT_HISTORY_LIMIT` messages (default: 10) from `chat_messages`
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
@@ -325,7 +336,9 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 - It creates an impressive, fluid demo experience
 - It demonstrates agentic AI capabilities — the core theme of the course
 
-If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
+Trades in a batch are executed sequentially in array order. Each trade is validated against the cash/position state as of the moment it executes — so if trade #1 consumes all available cash, trade #2 will fail validation and its error will be reported in the response.
+
+If any trade fails validation (e.g., insufficient cash, insufficient shares), the error is included in the chat response so the LLM can inform the user.
 
 ### System Prompt Guidance
 
@@ -339,7 +352,17 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 
 ### LLM Mock Mode
 
-When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenRouter. This enables:
+When `LLM_MOCK=true`, the backend returns the following deterministic mock response instead of calling OpenRouter:
+
+```json
+{
+  "message": "Your portfolio is looking good. You have $10,000 in cash and no open positions. I've bought 1 share of AAPL to get you started.",
+  "trades": [{"ticker": "AAPL", "side": "buy", "quantity": 1}],
+  "watchlist_changes": []
+}
+```
+
+This fixed response exercises trade execution (AAPL buy), produces a visible confirmation in the chat panel, and results in a position appearing in the positions table — covering the core E2E assertion path without any API calls. This enables:
 - Fast, free, reproducible E2E tests
 - Development without an API key
 - CI/CD pipelines
@@ -401,21 +424,27 @@ docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
 
 The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
 
-### Start/Stop Scripts
+### Primary Launch Method
 
-**`scripts/start_mac.sh`** (macOS/Linux):
-- Builds the Docker image if not already built (or if `--build` flag passed)
-- Runs the container with the volume mount, port mapping, and `.env` file
-- Prints the URL to access the app
-- Optionally opens the browser
+`docker-compose.yml` is the primary way to launch the app:
 
-**`scripts/stop_mac.sh`** (macOS/Linux):
-- Stops and removes the running container
-- Does NOT remove the volume (data persists)
+```bash
+docker compose up          # build and start
+docker compose down        # stop (data volume persists)
+docker compose up --build  # force rebuild
+```
 
-**`scripts/start_windows.ps1`** / **`scripts/stop_windows.ps1`**: PowerShell equivalents for Windows.
+The compose file handles the volume mount, port mapping, and `.env` file automatically.
 
-All scripts should be idempotent — safe to run multiple times.
+### Convenience Scripts (Optional)
+
+The `scripts/` directory contains thin wrappers around `docker compose` for users who prefer a guided experience:
+
+**`scripts/start_mac.sh`** (macOS/Linux): builds if needed, runs compose, prints the URL, optionally opens the browser.
+**`scripts/stop_mac.sh`**: stops the container, does NOT remove the data volume.
+**`scripts/start_windows.ps1`** / **`scripts/stop_windows.ps1`**: PowerShell equivalents.
+
+All scripts are idempotent — safe to run multiple times.
 
 ### Optional Cloud Deployment
 
@@ -455,38 +484,3 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
 
----
-
-## 13. Review Notes
-
-### Questions & Clarifications
-
-**Sparklines for newly added tickers**: Sparklines accumulate from SSE since page load. If the user adds a new ticker mid-session, its sparkline starts empty. Is that acceptable, or should the backend provide a short price history buffer for newly added tickers?
-ANSWER: Backend should provide a short price history buffer for newly added tickers.
-
-**Daily change % calculation**: The watchlist shows "daily change %" but the simulator only tracks current vs. previous tick prices — there's no concept of a session open price. Should daily % be calculated from each ticker's seed price? From the price at page load? Needs a decision before implementation.
-ANSWER: Daily % should be calculated from each ticker's seed price.
-
-**SSE stream scope vs. positions**: The SSE stream covers "all tickers known to the system." If a user removes a ticker from the watchlist but still holds a position in it, does that ticker still get priced? The positions table needs live prices for P&L calculations regardless of watchlist membership.
-ANSWER: Yes, still get the price.
-
-**Position row on full sell**: When a sell brings quantity to zero, should the `positions` row be deleted or kept at `quantity=0`? The plan doesn't specify; this affects the positions table display and P&L calculations.
-ANSWER: Delete the row.
-
-**LLM batch trade sequencing**: Multiple trades can arrive in a single LLM response. If trade #1 exhausts available cash, does trade #2 fail? Or does the backend simulate sequential execution in order? The plan says each trade is validated the same as manual trades, but doesn't address intra-batch ordering.
-ANSWER: Backend should simulate sequential execution in order.
-
-**Conversation history limit**: The backend loads "recent conversation history" from `chat_messages`. Is there a hard limit (e.g., last N messages)? Unbounded history will grow tokens/cost over time. An explicit cap should be specified.
-ANSWER: Show last 10 messages, also make it configurable from the backend.
-
-**Massive API endpoint**: The plan says "REST API polling" but doesn't name the specific Polygon.io endpoint. Implementing agents will need the exact endpoint (e.g., `/v2/snapshot/locale/us/markets/stocks/tickers`) to avoid ambiguity.
-ANSWER: Find the exact endpoint by going through the Massive API documentation.
-
-**`backend/db/` vs. `db/` naming**: Two directories named `db/` — one under `backend/` for schema files, one at the project root for the runtime SQLite file. This is a likely source of confusion for agents. Consider renaming `backend/db/` to `backend/schema/` or `backend/sql/`.
-ANSWER: Rename `backend/db/` to `backend/schema/`.
-
-**Use `docker compose up` as the primary launch method**: `docker-compose.yml` already exists. For students, `docker compose up` is a single, familiar command. The custom start/stop shell scripts add maintenance burden on top of it. Make the scripts thin wrappers or remove them in favor of a documented compose command.
-ANSWER: I agree.
-
-**`LLM_MOCK` mock response content is unspecified**: The plan says `LLM_MOCK=true` returns "deterministic mock responses" but doesn't define what those responses look like. E2E tests are written against these mocks — their content needs to be specified or the test scenarios will be underspecified.
-ANSWER: You need to define the response.
